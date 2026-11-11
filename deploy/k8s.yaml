@@ -1,0 +1,38 @@
+# kubectl create secret generic tg-relay --from-literal=token=<bot token> --from-literal=chat_id=<chat id>
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager-telegram-relay
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: alertmanager-telegram-relay }
+  template:
+    metadata:
+      labels: { app: alertmanager-telegram-relay }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 10001 }
+      containers:
+        - name: relay
+          image: ghcr.io/sakuratix/alertmanager-telegram-relay:latest
+          ports: [{ name: http, containerPort: 9087 }]
+          env:
+            - name: TELEGRAM_TOKEN
+              valueFrom: { secretKeyRef: { name: tg-relay, key: token } }
+            - name: TELEGRAM_CHAT_ID
+              valueFrom: { secretKeyRef: { name: tg-relay, key: chat_id } }
+          readinessProbe: { httpGet: { path: /healthz, port: http } }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 64Mi }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager-telegram-relay
+  namespace: monitoring
+spec:
+  selector: { app: alertmanager-telegram-relay }
+  ports: [{ name: http, port: 9087, targetPort: http }]
