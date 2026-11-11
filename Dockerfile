@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.15-slim
 RUN useradd --uid 10001 --no-create-home relay
 WORKDIR /app
 COPY relay.py .
