@@ -1,6 +1,6 @@
 # alertmanager-telegram-relay
 
-Маленький сервис без зависимостей: принимает webhook от Alertmanager и шлёт аккуратное сообщение в Telegram. Группирует алерты, ставит иконку по `severity`, экранирует HTML и укладывается в лимит Telegram на длину сообщения.
+Маленький сервис без зависимостей: принимает webhook от Alertmanager и шлёт аккуратное сообщение в Telegram. Группирует алерты, ставит иконку по `severity` и экранирует HTML. Если группа не влезает в лимит Telegram (4096 символов), она делится на несколько сообщений `part 1/3`, `part 2/3`…, а не обрезается: при массовой аварии важен каждый алерт.
 
 ```
 🚨 FIRING: HighErrorRate (2)
@@ -13,6 +13,8 @@
 ```bash
 docker run -e TELEGRAM_TOKEN=... -e TELEGRAM_CHAT_ID=... -p 9087:9087 ghcr.io/sakuratix/alertmanager-telegram-relay
 ```
+
+Чтобы писать в отдельную тему группы с топиками (forum), добавь `TELEGRAM_THREAD_ID`.
 
 В Kubernetes: `deploy/k8s.yaml` (токен берётся из Secret, контейнер без root и с read-only FS).
 

@@ -37,10 +37,25 @@ def test_format_resolved():
     assert relay.format_message(p).startswith("<b>✅ RESOLVED")
 
 
-def test_truncates_long_messages():
+def test_splits_long_groups_without_losing_alerts():
     p = dict(PAYLOAD)
-    p["alerts"] = PAYLOAD["alerts"] * 500
-    assert len(relay.format_message(p)) <= relay.MAX_LEN
+    p["alerts"] = [
+        {**PAYLOAD["alerts"][0], "labels": {**PAYLOAD["alerts"][0]["labels"], "instance": f"app-{i}:8080"}}
+        for i in range(500)
+    ]
+    parts = relay.format_messages(p)
+    assert len(parts) > 1
+    assert all(len(m) <= relay.MAX_LEN for m in parts)
+    assert parts[0].startswith("<b>🚨 FIRING: AppDown</b> (500) · part 1/")
+    body = "\n".join(parts)
+    assert all(f"app-{i}:8080" in body for i in range(500))
+
+
+def test_single_huge_annotation_is_shortened():
+    p = dict(PAYLOAD)
+    p["alerts"] = [{**PAYLOAD["alerts"][0], "annotations": {"summary": "x" * 10000}}]
+    parts = relay.format_messages(p)
+    assert len(parts) == 1 and len(parts[0]) <= relay.MAX_LEN
 
 
 def post(url, body):
