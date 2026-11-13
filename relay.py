@@ -11,6 +11,8 @@ Config (env):
 import html
 import json
 import os
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
@@ -59,7 +61,23 @@ def format_message(payload: dict) -> str:
     return format_messages(payload)[0]
 
 
-def telegram_sender(token: str, chat_id: str, thread_id: str = "") -> Callable[[str], None]:
+class SendError(RuntimeError):
+    pass
+
+
+def telegram_sender(
+    token: str,
+    chat_id: str,
+    thread_id: str = "",
+    *,
+    deadline: float = 8.0,
+    urlopen: Callable = urllib.request.urlopen,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> Callable[[str], None]:
+    """Return send(text). Retries 429 (honouring retry_after) and 5xx/network
+    errors with backoff, but gives up before `deadline` seconds so the
+    webhook still answers before Alertmanager's own timeout and it can retry."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
     def send(text: str) -> None:
@@ -67,11 +85,44 @@ def telegram_sender(token: str, chat_id: str, thread_id: str = "") -> Callable[[
         if thread_id:
             fields["message_thread_id"] = thread_id  # a topic in a forum-style group
         body = urllib.parse.urlencode(fields).encode()
-        with urllib.request.urlopen(url, data=body, timeout=10) as r:
-            if r.status != 200:
-                raise RuntimeError(f"telegram returned {r.status}")
+        start, attempt = clock(), 0
+        while True:
+            attempt += 1
+            try:
+                with urlopen(url, data=body, timeout=5) as r:
+                    if r.status == 200:
+                        return
+                    wait, why = None, f"telegram returned {r.status}"
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    wait, why = retry_after(e), "rate limited (429)"
+                elif e.code >= 500:
+                    wait, why = None, f"telegram returned {e.code}"
+                else:  # 400/401/403: retrying won't help, e.g. bad token or chat id
+                    raise SendError(f"telegram returned {e.code}: {error_text(e)}") from e
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                wait, why = None, f"network error: {getattr(e, 'reason', e)}"
+            if wait is None:
+                wait = min(0.5 * 2 ** (attempt - 1), 4.0)
+            if clock() - start + wait > deadline:
+                raise SendError(f"{why}, gave up after {attempt} attempt(s)")
+            sleep(wait)
 
     return send
+
+
+def retry_after(e: urllib.error.HTTPError) -> float:
+    try:
+        return float(json.loads(e.read() or b"{}").get("parameters", {}).get("retry_after", 1))
+    except (ValueError, AttributeError):
+        return 1.0
+
+
+def error_text(e: urllib.error.HTTPError) -> str:
+    try:
+        return json.loads(e.read() or b"{}").get("description", "")
+    except ValueError:
+        return ""
 
 
 def make_handler(send: Callable[[str], None]):

@@ -1,9 +1,12 @@
+import io
 import json
 import sys
 import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from http.server import ThreadingHTTPServer
@@ -78,3 +81,80 @@ def test_http_roundtrip():
         assert len(sent) == 1 and "AppDown" in sent[0]
     finally:
         server.shutdown()
+
+
+class FakeTelegram:
+    """Plays back a list of outcomes: an int HTTP status or an exception."""
+
+    def __init__(self, *outcomes):
+        self.outcomes, self.calls = list(outcomes), []
+
+    def __call__(self, url, data=None, timeout=None):
+        self.calls.append(data)
+        out = self.outcomes.pop(0)
+        if isinstance(out, Exception):
+            raise out
+        if out != 200:
+            body = json.dumps({"ok": False, "description": "nope", "parameters": {"retry_after": 3}}).encode()
+            raise urllib.error.HTTPError(url, out, "err", {}, io.BytesIO(body))
+        return _Resp(200)
+
+
+class _Resp:
+    def __init__(self, status):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def sender(fake, deadline=8.0):
+    t = [0.0]
+    slept = []
+
+    def sleep(s):
+        slept.append(s)
+        t[0] += s
+
+    send = relay.telegram_sender("T", "42", deadline=deadline, urlopen=fake, sleep=sleep, clock=lambda: t[0])
+    return send, slept
+
+
+def test_retries_rate_limit_using_retry_after():
+    fake = FakeTelegram(429, 200)
+    send, slept = sender(fake)
+    send("hi")
+    assert slept == [3.0] and len(fake.calls) == 2
+
+
+def test_retries_server_errors_with_backoff():
+    fake = FakeTelegram(502, urllib.error.URLError("timed out"), 200)
+    send, slept = sender(fake)
+    send("hi")
+    assert slept == [0.5, 1.0]
+
+
+def test_does_not_retry_client_errors():
+    fake = FakeTelegram(400)
+    send, slept = sender(fake)
+    with pytest.raises(relay.SendError, match="400: nope"):
+        send("hi")
+    assert slept == [] and len(fake.calls) == 1
+
+
+def test_gives_up_before_deadline():
+    fake = FakeTelegram(*([503] * 10))
+    send, slept = sender(fake, deadline=2.0)
+    with pytest.raises(relay.SendError, match="gave up"):
+        send("hi")
+    assert sum(slept) <= 2.0
+
+
+def test_thread_id_is_sent():
+    fake = FakeTelegram(200)
+    t = relay.telegram_sender("T", "42", "7", urlopen=fake, sleep=lambda s: None)
+    t("hi")
+    assert b"message_thread_id=7" in fake.calls[0]
