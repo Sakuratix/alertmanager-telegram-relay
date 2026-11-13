@@ -158,3 +158,33 @@ def test_thread_id_is_sent():
     t = relay.telegram_sender("T", "42", "7", urlopen=fake, sleep=lambda s: None)
     t("hi")
     assert b"message_thread_id=7" in fake.calls[0]
+
+
+def get(url):
+    with urllib.request.urlopen(url, timeout=5) as r:
+        return r.read().decode()
+
+
+def test_metrics_count_deliveries_and_failures():
+    calls = {"n": 0}
+
+    def flaky(text):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise relay.SendError("down")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), relay.make_handler(flaky, relay.Metrics()))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        assert post(base + "/alert", json.dumps(PAYLOAD).encode()) == 200
+        assert post(base + "/alert", json.dumps(dict(PAYLOAD, status="resolved")).encode()) == 502
+        m = get(base + "/metrics")
+    finally:
+        server.shutdown()
+    assert 'relay_webhooks_total{status="firing"} 1' in m
+    assert 'relay_webhooks_total{status="resolved"} 1' in m
+    assert "relay_alerts_total 2" in m
+    assert "relay_messages_sent_total 1" in m
+    assert "relay_send_failures_total 1" in m
+    assert "# TYPE relay_messages_sent_total counter" in m

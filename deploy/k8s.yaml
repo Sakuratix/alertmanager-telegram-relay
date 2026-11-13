@@ -11,6 +11,10 @@ spec:
   template:
     metadata:
       labels: { app: alertmanager-telegram-relay }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9087"
+        prometheus.io/path: /metrics
     spec:
       securityContext: { runAsNonRoot: true, runAsUser: 10001 }
       containers:
@@ -33,6 +37,35 @@ kind: Service
 metadata:
   name: alertmanager-telegram-relay
   namespace: monitoring
+  labels: { app: alertmanager-telegram-relay }
 spec:
   selector: { app: alertmanager-telegram-relay }
   ports: [{ name: http, port: 9087, targetPort: http }]
+---
+# If you run the Prometheus Operator (kube-prometheus-stack), scrape and alert on the relay itself:
+# a broken alert channel is the one failure nobody gets alerted about.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: alertmanager-telegram-relay
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels: { app: alertmanager-telegram-relay }
+  endpoints: [{ port: http, path: /metrics, interval: 30s }]
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: alertmanager-telegram-relay
+  namespace: monitoring
+spec:
+  groups:
+    - name: alertmanager-telegram-relay
+      rules:
+        - alert: TelegramRelayFailing
+          expr: increase(relay_send_failures_total[15m]) > 0
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: Alerts are not reaching Telegram ({{ $value | humanize }} failed deliveries in 15m)

@@ -1,6 +1,7 @@
 """Alertmanager webhook -> Telegram.
 
 POST /alert with the standard Alertmanager webhook payload.
+GET /healthz, GET /metrics (Prometheus).
 Config (env):
   TELEGRAM_TOKEN or TELEGRAM_TOKEN_FILE  bot token
   TELEGRAM_CHAT_ID                       chat or channel id
@@ -11,6 +12,7 @@ Config (env):
 import html
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -125,7 +127,63 @@ def error_text(e: urllib.error.HTTPError) -> str:
         return ""
 
 
-def make_handler(send: Callable[[str], None]):
+class Metrics:
+    """Prometheus counters in text exposition format, no client library needed."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.webhooks = {"firing": 0, "resolved": 0}
+        self.alerts = 0
+        self.sent = 0
+        self.failed = 0
+        self.send_seconds = 0.0
+        self.last_success = 0.0
+
+    def webhook(self, payload: dict) -> None:
+        with self._lock:
+            key = "resolved" if payload.get("status") == "resolved" else "firing"
+            self.webhooks[key] += 1
+            self.alerts += len(payload.get("alerts", []))
+
+    def delivered(self, messages: int, seconds: float) -> None:
+        with self._lock:
+            self.sent += messages
+            self.send_seconds += seconds
+            self.last_success = time.time()
+
+    def failure(self, seconds: float) -> None:
+        with self._lock:
+            self.failed += 1
+            self.send_seconds += seconds
+
+    def render(self) -> str:
+        with self._lock:
+            out = [
+                "# HELP relay_webhooks_total Webhooks received from Alertmanager.",
+                "# TYPE relay_webhooks_total counter",
+                *(f'relay_webhooks_total{{status="{k}"}} {v}' for k, v in sorted(self.webhooks.items())),
+                "# HELP relay_alerts_total Alerts contained in received webhooks.",
+                "# TYPE relay_alerts_total counter",
+                f"relay_alerts_total {self.alerts}",
+                "# HELP relay_messages_sent_total Telegram messages delivered.",
+                "# TYPE relay_messages_sent_total counter",
+                f"relay_messages_sent_total {self.sent}",
+                "# HELP relay_send_failures_total Webhooks that could not be delivered (answered 502).",
+                "# TYPE relay_send_failures_total counter",
+                f"relay_send_failures_total {self.failed}",
+                "# HELP relay_send_seconds_total Time spent talking to Telegram, retries included.",
+                "# TYPE relay_send_seconds_total counter",
+                f"relay_send_seconds_total {self.send_seconds:.3f}",
+                "# HELP relay_last_success_timestamp_seconds Unix time of the last delivered webhook.",
+                "# TYPE relay_last_success_timestamp_seconds gauge",
+                f"relay_last_success_timestamp_seconds {self.last_success:.0f}",
+            ]
+        return "\n".join(out) + "\n"
+
+
+def make_handler(send: Callable[[str], None], metrics: Metrics | None = None):
+    metrics = metrics or Metrics()
+
     class Handler(BaseHTTPRequestHandler):
         def _reply(self, code: int, msg: str) -> None:
             data = json.dumps({"status": msg}).encode()
@@ -138,6 +196,13 @@ def make_handler(send: Callable[[str], None]):
         def do_GET(self) -> None:
             if self.path == "/healthz":
                 self._reply(200, "ok")
+            elif self.path == "/metrics":
+                data = metrics.render().encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
             else:
                 self._reply(404, "not found")
 
@@ -151,12 +216,16 @@ def make_handler(send: Callable[[str], None]):
             except (ValueError, json.JSONDecodeError):
                 self._reply(400, "bad json")
                 return
+            metrics.webhook(payload)
+            started, messages = time.monotonic(), format_messages(payload)
             try:
-                for text in format_messages(payload):
+                for text in messages:
                     send(text)
             except Exception as e:  # report any delivery failure to Alertmanager
+                metrics.failure(time.monotonic() - started)
                 self._reply(502, f"send failed: {e}")
                 return
+            metrics.delivered(len(messages), time.monotonic() - started)
             self._reply(200, "sent")
 
         def log_message(self, fmt: str, *args) -> None:
