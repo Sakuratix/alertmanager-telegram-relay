@@ -6,9 +6,11 @@ Config (env):
   TELEGRAM_TOKEN or TELEGRAM_TOKEN_FILE  bot token
   TELEGRAM_CHAT_ID                       chat or channel id
   TELEGRAM_THREAD_ID                     optional topic id in a forum group
+  WEBHOOK_TOKEN or WEBHOOK_TOKEN_FILE    optional: require "Authorization: Bearer <token>" on /alert
   PORT                                   default 9087
 """
 
+import hmac
 import html
 import json
 import os
@@ -201,6 +203,7 @@ class Metrics:
         self.failed = 0
         self.send_seconds = 0.0
         self.last_success = 0.0
+        self.rejected: dict[str, int] = {}
 
     def webhook(self, payload: dict) -> None:
         with self._lock:
@@ -213,6 +216,10 @@ class Metrics:
             self.sent += messages
             self.send_seconds += seconds
             self.last_success = time.time()
+
+    def reject(self, reason: str) -> None:
+        with self._lock:
+            self.rejected[reason] = self.rejected.get(reason, 0) + 1
 
     def failure(self, seconds: float) -> None:
         with self._lock:
@@ -240,12 +247,21 @@ class Metrics:
                 "# HELP relay_last_success_timestamp_seconds Unix time of the last delivered webhook.",
                 "# TYPE relay_last_success_timestamp_seconds gauge",
                 f"relay_last_success_timestamp_seconds {self.last_success:.0f}",
+                "# HELP relay_rejected_requests_total Requests to /alert refused before delivery.",
+                "# TYPE relay_rejected_requests_total counter",
+                *(
+                    f'relay_rejected_requests_total{{reason="{k}"}} {v}'
+                    for k, v in sorted(self.rejected.items())
+                ),
             ]
         return "\n".join(out) + "\n"
 
 
-def make_handler(send: Callable[[str], None], metrics: Metrics | None = None):
+def make_handler(send: Callable[[str], None], metrics: Metrics | None = None, token: str = ""):
+    """token: when set, POST /alert needs "Authorization: Bearer <token>".
+    Without it anyone who can reach the port can post to your on-call chat."""
     metrics = metrics or Metrics()
+    expected = f"Bearer {token}".encode() if token else b""
 
     class Handler(BaseHTTPRequestHandler):
         def _reply(self, code: int, msg: str) -> None:
@@ -273,6 +289,10 @@ def make_handler(send: Callable[[str], None], metrics: Metrics | None = None):
             if self.path != "/alert":
                 self._reply(404, "not found")
                 return
+            if expected and not hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected):
+                metrics.reject("unauthorized")
+                self._reply(401, "unauthorized")
+                return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length) or b"{}")
@@ -297,19 +317,27 @@ def make_handler(send: Callable[[str], None], metrics: Metrics | None = None):
     return Handler
 
 
-def load_token() -> str:
-    path = os.getenv("TELEGRAM_TOKEN_FILE")
+def load_secret(name: str, required: bool = True) -> str:
+    """NAME_FILE (a mounted secret) wins over NAME."""
+    path = os.getenv(f"{name}_FILE")
     if path:
         with open(path) as f:
             return f.read().strip()
-    return os.environ["TELEGRAM_TOKEN"]
+    return os.environ[name] if required else os.getenv(name, "")
+
+
+def load_token() -> str:
+    return load_secret("TELEGRAM_TOKEN")
 
 
 def main() -> None:
     send = telegram_sender(load_token(), os.environ["TELEGRAM_CHAT_ID"], os.getenv("TELEGRAM_THREAD_ID", ""))
     port = int(os.getenv("PORT", "9087"))
     print(f"listening on :{port}", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", port), make_handler(send)).serve_forever()
+    token = load_secret("WEBHOOK_TOKEN", required=False)
+    if not token:
+        print("WEBHOOK_TOKEN is not set: /alert accepts unauthenticated requests", flush=True)
+    ThreadingHTTPServer(("0.0.0.0", port), make_handler(send, token=token)).serve_forever()
 
 
 if __name__ == "__main__":

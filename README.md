@@ -30,6 +30,17 @@ receivers:
         send_resolved: true
 ```
 
+Чтобы вебхук не мог дёрнуть кто угодно, кто достучался до порта, задай `WEBHOOK_TOKEN` (или `WEBHOOK_TOKEN_FILE`) и тот же токен в Alertmanager:
+
+```yaml
+    webhook_configs:
+      - url: http://alertmanager-telegram-relay.monitoring:9087/alert
+        http_config:
+          authorization: { credentials_file: /etc/alertmanager/secrets/tg-relay/webhook_token }
+```
+
+Запросы без токена получают 401 и считаются в `relay_rejected_requests_total{reason="unauthorized"}`.
+
 Для кнопки silence у Alertmanager должен быть задан `--web.external-url` (он приходит в вебхуке как `externalURL`).
 
 Ошибки доставки:

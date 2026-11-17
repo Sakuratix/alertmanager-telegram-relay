@@ -61,8 +61,10 @@ def test_single_huge_annotation_is_shortened():
     assert len(parts) == 1 and len(parts[0]) <= relay.MAX_LEN
 
 
-def post(url, body):
-    req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
+def post(url, body, headers=None):
+    req = urllib.request.Request(
+        url, data=body, method="POST", headers={"Content-Type": "application/json", **(headers or {})}
+    )
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return r.status
@@ -262,3 +264,23 @@ def test_links_only_for_http_urls():
 )
 def test_human(seconds, want):
     assert relay.human(seconds) == want
+
+
+def serve(handler):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_port}"
+
+
+def test_webhook_token_is_required_when_set():
+    sent, metrics = [], relay.Metrics()
+    server, base = serve(relay.make_handler(sent.append, metrics, token="s3cret"))
+    body = json.dumps(PAYLOAD).encode()
+    try:
+        assert post(base + "/alert", body) == 401
+        assert post(base + "/alert", body, {"Authorization": "Bearer wrong"}) == 401
+        assert post(base + "/alert", body, {"Authorization": "Bearer s3cret"}) == 200
+        assert len(sent) == 1
+        assert 'relay_rejected_requests_total{reason="unauthorized"} 2' in metrics.render()
+    finally:
+        server.shutdown()
