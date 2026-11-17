@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SEVERITY_ICON = {"critical": "🔴", "warning": "🟠", "info": "🔵"}
 MAX_LEN = 4000  # Telegram limit is 4096
+MAX_BODY = 1 << 20  # a webhook with thousands of alerts is ~1 MiB; anything bigger is not Alertmanager
 
 
 def parse_time(value: str | None) -> datetime | None:
@@ -318,8 +319,19 @@ def make_handler(
                 to = (chat, thread)
             try:
                 length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = -1
+            if not 0 <= length <= MAX_BODY:
+                metrics.reject("bad_length")
+                self.close_connection = True  # don't read an unbounded body
+                self._reply(413, f"body must be 0..{MAX_BODY} bytes")
+                return
+            try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
-            except (ValueError, json.JSONDecodeError):
+                if not isinstance(payload, dict):
+                    raise ValueError("payload is not an object")
+            except ValueError:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
+                metrics.reject("bad_json")
                 self._reply(400, "bad json")
                 return
             metrics.webhook(payload)

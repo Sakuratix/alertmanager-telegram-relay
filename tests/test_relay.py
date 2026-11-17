@@ -313,3 +313,17 @@ def test_sender_override_goes_into_the_request():
     send("hi", ("-1009", "3"))
     fields = urllib.parse.parse_qs(fake.calls[0].decode())
     assert fields["chat_id"] == ["-1009"] and fields["message_thread_id"] == ["3"]
+
+
+def test_refuses_oversized_and_non_object_bodies():
+    sent, metrics = [], relay.Metrics()
+    server, base = serve(relay.make_handler(sent.append, metrics))
+    try:
+        assert post(base + "/alert", b"x" * (relay.MAX_BODY + 1)) == 413
+        assert post(base + "/alert", b"[1, 2]") == 400
+        assert post(base + "/alert", b"\xff\xfe") == 400
+        assert sent == []
+        text = metrics.render()
+        assert 'reason="bad_length"} 1' in text and 'reason="bad_json"} 2' in text
+    finally:
+        server.shutdown()

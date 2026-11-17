@@ -17,7 +17,8 @@ spec:
         prometheus.io/port: "9087"
         prometheus.io/path: /metrics
     spec:
-      securityContext: { runAsNonRoot: true, runAsUser: 10001 }
+      securityContext: { runAsNonRoot: true, runAsUser: 10001, seccompProfile: { type: RuntimeDefault } }
+      automountServiceAccountToken: false
       containers:
         - name: relay
           image: ghcr.io/sakuratix/alertmanager-telegram-relay:latest
@@ -30,10 +31,14 @@ spec:
             - name: WEBHOOK_TOKEN
               valueFrom: { secretKeyRef: { name: tg-relay, key: webhook_token, optional: true } }
           readinessProbe: { httpGet: { path: /healthz, port: http } }
+          livenessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 20, failureThreshold: 3 }
           resources:
             requests: { cpu: 10m, memory: 32Mi }
             limits: { memory: 64Mi }
-          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
 ---
 apiVersion: v1
 kind: Service
