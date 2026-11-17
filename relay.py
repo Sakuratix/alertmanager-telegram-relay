@@ -7,6 +7,7 @@ Config (env):
   TELEGRAM_CHAT_ID                       chat or channel id
   TELEGRAM_THREAD_ID                     optional topic id in a forum group
   WEBHOOK_TOKEN or WEBHOOK_TOKEN_FILE    optional: require "Authorization: Bearer <token>" on /alert
+  ALLOWED_CHAT_IDS                       optional: chats a receiver may pick with /alert?chat=ID[&thread=N]
   PORT                                   default 9087
 """
 
@@ -147,10 +148,12 @@ def telegram_sender(
     webhook still answers before Alertmanager's own timeout and it can retry."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-    def send(text: str) -> None:
-        fields = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"}
-        if thread_id:
-            fields["message_thread_id"] = thread_id  # a topic in a forum-style group
+    def send(text: str, to: tuple[str, str] | None = None) -> None:
+        """to: (chat_id, thread_id) overriding the defaults for this message."""
+        chat, thread = to or (chat_id, thread_id)
+        fields = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"}
+        if thread:
+            fields["message_thread_id"] = thread  # a topic in a forum-style group
         body = urllib.parse.urlencode(fields).encode()
         start, attempt = clock(), 0
         while True:
@@ -257,9 +260,19 @@ class Metrics:
         return "\n".join(out) + "\n"
 
 
-def make_handler(send: Callable[[str], None], metrics: Metrics | None = None, token: str = ""):
+def make_handler(
+    send: Callable[..., None],
+    metrics: Metrics | None = None,
+    token: str = "",
+    allowed_chats: frozenset[str] = frozenset(),
+):
     """token: when set, POST /alert needs "Authorization: Bearer <token>".
-    Without it anyone who can reach the port can post to your on-call chat."""
+    Without it anyone who can reach the port can post to your on-call chat.
+
+    allowed_chats: chat ids an Alertmanager receiver may route to with
+    /alert?chat=ID (and optionally &thread=N), so one relay serves several
+    teams. Any other chat is refused: the relay must not become a way to
+    make the bot write anywhere."""
     metrics = metrics or Metrics()
     expected = f"Bearer {token}".encode() if token else b""
 
@@ -286,13 +299,23 @@ def make_handler(send: Callable[[str], None], metrics: Metrics | None = None, to
                 self._reply(404, "not found")
 
         def do_POST(self) -> None:
-            if self.path != "/alert":
+            url = urllib.parse.urlsplit(self.path)
+            if url.path != "/alert":
                 self._reply(404, "not found")
                 return
             if expected and not hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected):
                 metrics.reject("unauthorized")
                 self._reply(401, "unauthorized")
                 return
+            query = urllib.parse.parse_qs(url.query)
+            to = None
+            if chat := query.get("chat", [""])[0]:
+                thread = query.get("thread", [""])[0]
+                if chat not in allowed_chats or (thread and not thread.isdigit()):
+                    metrics.reject("chat_not_allowed")
+                    self._reply(403, "chat not allowed")
+                    return
+                to = (chat, thread)
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length) or b"{}")
@@ -303,7 +326,7 @@ def make_handler(send: Callable[[str], None], metrics: Metrics | None = None, to
             started, messages = time.monotonic(), format_messages(payload)
             try:
                 for text in messages:
-                    send(text)
+                    send(text, to) if to else send(text)
             except Exception as e:  # report any delivery failure to Alertmanager
                 metrics.failure(time.monotonic() - started)
                 self._reply(502, f"send failed: {e}")
@@ -337,7 +360,9 @@ def main() -> None:
     token = load_secret("WEBHOOK_TOKEN", required=False)
     if not token:
         print("WEBHOOK_TOKEN is not set: /alert accepts unauthenticated requests", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", port), make_handler(send, token=token)).serve_forever()
+    allowed = frozenset(c.strip() for c in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if c.strip())
+    handler = make_handler(send, token=token, allowed_chats=allowed)
+    ThreadingHTTPServer(("0.0.0.0", port), handler).serve_forever()
 
 
 if __name__ == "__main__":

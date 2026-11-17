@@ -30,6 +30,17 @@ receivers:
         send_resolved: true
 ```
 
+Один relay на несколько команд: перечисли разрешённые чаты в `ALLOWED_CHAT_IDS` и укажи нужный в URL ресивера, при желании с темой форума:
+
+```yaml
+receivers:
+  - name: payments-oncall
+    webhook_configs:
+      - url: http://alertmanager-telegram-relay.monitoring:9087/alert?chat=-1001234567890&thread=42
+```
+
+Чат не из списка получает 403: бот не должен писать куда попросят.
+
 Чтобы вебхук не мог дёрнуть кто угодно, кто достучался до порта, задай `WEBHOOK_TOKEN` (или `WEBHOOK_TOKEN_FILE`) и тот же токен в Alertmanager:
 
 ```yaml

@@ -3,6 +3,7 @@ import json
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -284,3 +285,31 @@ def test_webhook_token_is_required_when_set():
         assert 'relay_rejected_requests_total{reason="unauthorized"} 2' in metrics.render()
     finally:
         server.shutdown()
+
+
+def test_routes_to_an_allowed_chat_and_refuses_others():
+    sent, metrics = [], relay.Metrics()
+
+    def send(text, to=None):
+        sent.append(to)
+
+    handler = relay.make_handler(send, metrics, allowed_chats=frozenset({"-1001", "-1002"}))
+    server, base = serve(handler)
+    body = json.dumps(PAYLOAD).encode()
+    try:
+        assert post(base + "/alert", body) == 200
+        assert post(base + "/alert?chat=-1002&thread=7", body) == 200
+        assert post(base + "/alert?chat=-1003", body) == 403
+        assert post(base + "/alert?chat=-1001&thread=x", body) == 403
+        assert sent == [None, ("-1002", "7")]
+        assert 'relay_rejected_requests_total{reason="chat_not_allowed"} 2' in metrics.render()
+    finally:
+        server.shutdown()
+
+
+def test_sender_override_goes_into_the_request():
+    fake = FakeTelegram(200)
+    send, _ = sender(fake)
+    send("hi", ("-1009", "3"))
+    fields = urllib.parse.parse_qs(fake.calls[0].decode())
+    assert fields["chat_id"] == ["-1009"] and fields["message_thread_id"] == ["3"]
