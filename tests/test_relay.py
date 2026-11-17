@@ -188,3 +188,77 @@ def test_metrics_count_deliveries_and_failures():
     assert "relay_messages_sent_total 1" in m
     assert "relay_send_failures_total 1" in m
     assert "# TYPE relay_messages_sent_total counter" in m
+
+
+NOW = relay.datetime(2026, 11, 17, 6, 0, tzinfo=relay.UTC)
+
+
+def test_duration_runbook_graph_and_silence():
+    p = {
+        "status": "firing",
+        "externalURL": "http://alertmanager.monitoring:9093/",
+        "groupLabels": {"alertname": "AppDown", "namespace": "shop"},
+        "commonLabels": {"alertname": "AppDown"},
+        "alerts": [
+            dict(
+                PAYLOAD["alerts"][0],
+                startsAt="2026-11-17T05:46:30.123456789Z",
+                endsAt="0001-01-01T00:00:00Z",
+                generatorURL="http://prometheus:9090/graph?g0.expr=up%3D%3D0",
+                annotations={"summary": "app is down", "runbook_url": "https://runbooks.example/AppDown"},
+            )
+        ],
+    }
+    text = relay.format_messages(p, now=NOW)[0]
+    assert "· for 13m" in text
+    assert '<a href="https://runbooks.example/AppDown">runbook</a>' in text
+    assert '<a href="http://prometheus:9090/graph?g0.expr=up%3D%3D0">graph</a>' in text
+    silence = "http://alertmanager.monitoring:9093/#/silences/new?filter="
+    assert silence + "%7Balertname%3D%22AppDown%22%2Cnamespace%3D%22shop%22%7D" in text
+
+
+def test_resolved_shows_how_long_it_lasted_and_no_silence_link():
+    a = dict(
+        PAYLOAD["alerts"][0],
+        status="resolved",
+        startsAt="2026-11-17T03:00:00Z",
+        endsAt="2026-11-17T05:05:00Z",
+    )
+    p = dict(
+        PAYLOAD,
+        status="resolved",
+        alerts=[a],
+        externalURL="http://am:9093",
+        groupLabels={"alertname": "AppDown"},
+    )
+    text = relay.format_messages(p, now=NOW)[0]
+    assert "lasted 2h5m" in text
+    assert "silence" not in text
+
+
+def test_links_only_for_http_urls():
+    a = dict(
+        PAYLOAD["alerts"][0],
+        generatorURL="javascript:alert(1)",
+        annotations={"summary": "x", "runbook_url": 'https://x/"><b>'},
+    )
+    text = relay.format_messages(dict(PAYLOAD, alerts=[a]), now=NOW)[0]
+    assert "javascript:" not in text
+    assert 'href="https://x/&quot;&gt;&lt;b&gt;"' in text
+
+
+@pytest.mark.parametrize(
+    ("seconds", "want"),
+    [
+        (0, "0s"),
+        (59, "59s"),
+        (60, "1m"),
+        (3599, "59m"),
+        (3600, "1h"),
+        (7500, "2h5m"),
+        (86400, "1d"),
+        (97200, "1d3h"),
+    ],
+)
+def test_human(seconds, want):
+    assert relay.human(seconds) == want

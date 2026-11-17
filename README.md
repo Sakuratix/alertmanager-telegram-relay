@@ -3,10 +3,12 @@
 Маленький сервис без зависимостей: принимает webhook от Alertmanager и шлёт аккуратное сообщение в Telegram. Группирует алерты, ставит иконку по `severity` и экранирует HTML. Если группа не влезает в лимит Telegram (4096 символов), она делится на несколько сообщений `part 1/3`, `part 2/3`…, а не обрезается: при массовой аварии важен каждый алерт.
 
 ```
-🚨 FIRING: HighErrorRate (2)
-🟠 more than 5% of requests fail  api-7d9f
-🟠 more than 5% of requests fail  api-x2kq
+🚨 FIRING: HighErrorRate (2) · 🔕 silence
+🟠 more than 5% of requests fail  api-7d9f · for 14m · runbook · graph
+🟠 more than 5% of requests fail  api-x2kq · for 3m · runbook · graph
 ```
+
+У каждого алерта видно, сколько он уже горит (а в RESOLVED, сколько длился), и ссылки на `runbook_url` и график в Prometheus. «🔕 silence» открывает форму тишины в Alertmanager с уже заполненными лейблами группы: дежурный глушит шумный алерт в два тапа с телефона. Ссылки берутся только с `http(s)://`, всё остальное из лейблов отбрасывается.
 
 ## Запуск
 
@@ -27,6 +29,8 @@ receivers:
       - url: http://alertmanager-telegram-relay.monitoring:9087/alert
         send_resolved: true
 ```
+
+Для кнопки silence у Alertmanager должен быть задан `--web.external-url` (он приходит в вебхуке как `externalURL`).
 
 Ошибки доставки:
 

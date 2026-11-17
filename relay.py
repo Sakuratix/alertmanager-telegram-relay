@@ -12,38 +12,101 @@ Config (env):
 import html
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SEVERITY_ICON = {"critical": "🔴", "warning": "🟠", "info": "🔵"}
 MAX_LEN = 4000  # Telegram limit is 4096
 
 
-def format_messages(payload: dict) -> list[str]:
+def parse_time(value: str | None) -> datetime | None:
+    """Alertmanager RFC 3339 timestamp, or None for empty / the zero time it uses for "unset"."""
+    if not value or value.startswith("0001-"):
+        return None
+    value = re.sub(r"(\.\d{6})\d+", r"\1", value.replace("Z", "+00:00"))  # nanoseconds -> micro
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def human(seconds: float) -> str:
+    """5s, 14m, 2h5m, 3d4h: precise enough for a chat message."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    m = s // 60
+    if m < 60:
+        return f"{m}m"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h{m}m" if m else f"{h}h"
+    d, h = divmod(h, 24)
+    return f"{d}d{h}h" if h else f"{d}d"
+
+
+def link(url: str | None, text: str) -> str:
+    """An <a> tag for http(s) URLs only; anything else from a label is dropped."""
+    if not url or not url.startswith(("http://", "https://")):
+        return ""
+    return f'<a href="{html.escape(url, quote=True)}">{text}</a>'
+
+
+def silence_url(payload: dict) -> str | None:
+    """Alertmanager UI link that pre-fills a silence for this group's labels."""
+    base = payload.get("externalURL")
+    group = payload.get("groupLabels") or {}
+    if not base or not group:
+        return None
+    matchers = ",".join(f'{k}="{v}"' for k, v in sorted(group.items()))
+    return f"{base.rstrip('/')}/#/silences/new?filter={urllib.parse.quote('{' + matchers + '}')}"
+
+
+def format_messages(payload: dict, now: datetime | None = None) -> list[str]:
     """Render a webhook payload as one or more Telegram messages.
+
+    Each alert gets how long it has been firing (or how long it lasted, once
+    resolved) and links to its runbook and graph when Alertmanager has them.
+    A firing group gets a one-tap link to silence it.
 
     Big alert groups are split at line boundaries instead of being cut off,
     so nothing is lost; every part repeats the header with its number.
     """
+    now = now or datetime.now(UTC)
     status = payload.get("status", "firing")
     alerts = payload.get("alerts", [])
     common = payload.get("commonLabels", {})
     name = html.escape(common.get("alertname", "alert"))
     head = "✅ RESOLVED" if status == "resolved" else "🚨 FIRING"
     header = f"<b>{head}: {name}</b> ({len(alerts)})"
+    if status != "resolved" and (silence := link(silence_url(payload), "🔕 silence")):
+        header += f" · {silence}"
     lines = []
     for a in alerts:
         labels, ann = a.get("labels", {}), a.get("annotations", {})
-        icon = "✅" if a.get("status") == "resolved" else SEVERITY_ICON.get(labels.get("severity", ""), "⚪")
+        resolved = a.get("status") == "resolved"
+        icon = "✅" if resolved else SEVERITY_ICON.get(labels.get("severity", ""), "⚪")
         summary = html.escape(ann.get("summary") or ann.get("description") or labels.get("alertname", ""))
         where = html.escape(labels.get("instance") or labels.get("pod") or labels.get("job") or "")
         line = f"{icon} {summary}" + (f" <code>{where}</code>" if where else "")
-        lines.append(line if len(line) <= MAX_LEN // 2 else line[: MAX_LEN // 2 - 1] + "…")
+        if len(line) > MAX_LEN // 2:
+            line = line[: MAX_LEN // 2 - 1] + "…"
+        extras = []
+        if started := parse_time(a.get("startsAt")):
+            ended = parse_time(a.get("endsAt")) if resolved else None
+            took = human(((ended or now) - started).total_seconds())
+            extras.append(f"lasted {took}" if resolved else f"for {took}")
+        extras += [
+            x for x in (link(ann.get("runbook_url"), "runbook"), link(a.get("generatorURL"), "graph")) if x
+        ]
+        lines.append(line + (" · " + " · ".join(extras) if extras else ""))
 
     chunks: list[list[str]] = [[]]
     size = len(header) + 16  # room for " · part 9/9"
